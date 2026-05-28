@@ -62,7 +62,7 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
 
   async ensureToolInstalled(): Promise<void> {
     const dataDir =
-      this.host?.getDataDir?.() ?? path.join(process.env.HOME ?? ".", ".boff/vibecontrols");
+      this.host?.getDataDir?.() ?? path.join(os.homedir(), ".boff/vibecontrols");
     const ctx = {
       dataDir,
       log: {
