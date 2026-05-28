@@ -20,7 +20,7 @@ import type {
 import { SemgrepOsvScannerProvider } from "./provider.js";
 
 const PLUGIN_NAME = "security-sast-deep";
-const PLUGIN_VERSION = "2026.528.4";
+const PLUGIN_VERSION = "2026.528.6";
 
 export const createPlugin: VibePluginFactory = (_ctx: ProfileContext): VibePlugin => {
   const provider = new SemgrepOsvScannerProvider();

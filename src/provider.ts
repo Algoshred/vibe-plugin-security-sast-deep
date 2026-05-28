@@ -1,19 +1,31 @@
 /**
  * SemgrepOsvScannerProvider — implements SecurityProvider for stage
- * `pull_request.deep`. Runs Semgrep with the full ruleset (`--config
- * auto`) for SAST plus osv-scanner against package manifests for SCA.
+ * `pull_request.deep`. Runs Semgrep with a sensible default ruleset
+ * (`--config p/default`) for SAST plus osv-scanner against package
+ * manifests for SCA. Both tools run sequentially and have a per-tool
+ * wall-clock cap.
  *
- * TODO: Wave 2 scaffold — real Semgrep + osv-scanner integration is
- * pending. This v1 verifies tool paths resolve and returns a single
- * info finding describing what a real scan would do.
+ * Tool resolution:
+ *   - osv-scanner is resolved via the shared tool-installer with a
+ *     pinned binary + sha256.
+ *   - Semgrep has no upstream prebuilt binary; the installer's PATH
+ *     probe finds it if available. If neither PATH nor a previous
+ *     install is present, ensureToolInstalled() auto-installs via
+ *     `pipx install semgrep==<ver>` (preferred) or
+ *     `python3 -m pip install --user semgrep==<ver>` (fallback).
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import type { HostServices } from "@vibecontrols/plugin-sdk/contract";
+import { normalizeSarif } from "@vibecontrols/vibe-plugin-security/normalizer";
 import { resolveToolPath } from "@vibecontrols/vibe-plugin-security/tool-installer";
 import type {
   NormalizedFinding,
+  ScanEvidenceArtifact,
   SecurityProvider,
   SecurityProviderMetadata,
   SecurityScanInput,
@@ -24,6 +36,16 @@ import type {
 
 import { OSV_SCANNER_VERSION, SEMGREP_VERSION, TOOLS_MANIFEST } from "./tools-manifest.js";
 
+interface SastDeepConfig {
+  semgrepConfig?: string;
+  extraSemgrepArgs?: string[];
+  extraOsvScannerArgs?: string[];
+  toolTimeoutMs?: number;
+}
+
+const DEFAULT_TOOL_TIMEOUT_MS = 10 * 60 * 1000;
+const LOG_NAMESPACE = "semgrep-osv-scanner-provider";
+
 export class SemgrepOsvScannerProvider implements SecurityProvider {
   readonly name = "semgrep-osv-scanner";
   readonly stage: SecurityStage = "pull_request.deep";
@@ -32,6 +54,7 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
   private host?: HostServices;
   private semgrepPath?: string;
   private osvScannerPath?: string;
+  private active = new Map<string, ChildProcess>();
 
   async init(host: HostServices): Promise<void> {
     this.host = host;
@@ -43,22 +66,21 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
     const ctx = {
       dataDir,
       log: {
-        info: (m: string) => this.host?.logger?.info?.("semgrep-osv-scanner-provider", m),
-        warn: (m: string) => this.host?.logger?.warn?.("semgrep-osv-scanner-provider", m),
-        error: (m: string) => this.host?.logger?.error?.("semgrep-osv-scanner-provider", m),
+        info: (m: string) => this.host?.logger?.info?.(LOG_NAMESPACE, m),
+        warn: (m: string) => this.host?.logger?.warn?.(LOG_NAMESPACE, m),
+        error: (m: string) => this.host?.logger?.error?.(LOG_NAMESPACE, m),
       },
     };
-    // Resolve both binaries up front so we surface manifest mismatches
-    // early. Semgrep PATH fallback is expected on darwin/windows where
-    // we don't ship a prebuilt binary; the tool-installer handles that.
-    this.semgrepPath = await resolveToolPath(ctx, "semgrep", TOOLS_MANIFEST.semgrep);
+
+    // osv-scanner: shipped as a pinned binary + sha256. Pure download path.
     this.osvScannerPath = await resolveToolPath(ctx, "osv-scanner", TOOLS_MANIFEST["osv-scanner"]);
+
+    // semgrep: PATH first; if not present, attempt pipx then pip --user.
+    this.semgrepPath = await this.resolveSemgrep(ctx.log);
   }
 
   async run(input: SecurityScanInput): Promise<SecurityScanResult> {
     const startedAt = Date.now();
-    input.onProgress?.({ pct: 10, message: "Verifying semgrep + osv-scanner tool paths" });
-
     try {
       if (!this.semgrepPath || !this.osvScannerPath) {
         await this.ensureToolInstalled();
@@ -75,42 +97,128 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
       };
     }
 
-    input.onProgress?.({ pct: 100, message: "Stub finding emitted" });
+    const cfg = (input.config as SastDeepConfig) ?? {};
+    const timeoutMs =
+      typeof cfg.toolTimeoutMs === "number" && cfg.toolTimeoutMs > 0
+        ? cfg.toolTimeoutMs
+        : DEFAULT_TOOL_TIMEOUT_MS;
+    const findings: NormalizedFinding[] = [];
+    const evidence: ScanEvidenceArtifact[] = [];
+    let lastError: string | undefined;
 
-    const fingerprint = createHash("sha256").update(`${this.name}:${input.runId}`).digest("hex");
+    input.onProgress?.({ pct: 5, message: "Starting Semgrep scan" });
 
-    const finding: NormalizedFinding = {
-      fingerprint,
-      ruleId: `${this.name}.stub`,
-      title: "pull_request.deep: semgrep-osv-scanner scaffolded — real scanner integration pending",
-      severity: "info",
-      category: "sast",
-      description:
-        "Wave 2 scaffold: when integrated, this provider will run `semgrep --config auto --sarif` for full-ruleset SAST and `osv-scanner --recursive` against package manifests (package.json, go.mod, Cargo.toml, requirements.txt, Gemfile.lock, etc.) for SCA. Findings will be normalized into NormalizedFinding[] with category `sast` for Semgrep rules and `vuln` for osv-scanner CVEs. See src/provider.ts TODO.",
-      rawProviderRef: JSON.stringify({
-        stub: true,
-        message: `Real semgrep + osv-scanner integration pending; semgrep path resolves to ${
-          this.semgrepPath ?? "<unresolved>"
-        }, osv-scanner path resolves to ${this.osvScannerPath ?? "<unresolved>"}.`,
-        semgrepVersion: SEMGREP_VERSION,
-        osvScannerVersion: OSV_SCANNER_VERSION,
-      }),
-    };
+    // ---- Semgrep ----
+    try {
+      const semgrepSarif = path.join(input.workdir, "semgrep.sarif");
+      const semgrepArgs = [
+        "--config",
+        cfg.semgrepConfig ?? "p/default",
+        "--sarif",
+        "--output",
+        semgrepSarif,
+        "--quiet",
+        "--no-rewrite-rule-ids",
+        "--disable-version-check",
+        "--metrics",
+        "off",
+      ];
+      if (cfg.extraSemgrepArgs) semgrepArgs.push(...cfg.extraSemgrepArgs);
+      semgrepArgs.push(input.repoLocalPath);
 
-    const summary: SecurityScanSummary = { critical: 0, high: 0, medium: 0, low: 0, info: 1 };
+      input.onProgress?.({ pct: 10, message: "Running Semgrep (SAST)" });
+
+      const semgrepRes = await this.spawnAndWait(input.runId, this.semgrepPath!, semgrepArgs, {
+        timeoutMs,
+      });
+
+      if (semgrepRes.code !== 0 && semgrepRes.code !== 1) {
+        lastError = `semgrep exited ${semgrepRes.code}: ${semgrepRes.stderr.slice(0, 500)}`;
+        this.host?.logger?.warn?.(LOG_NAMESPACE, lastError);
+      } else {
+        input.onProgress?.({ pct: 30, message: "Parsing Semgrep SARIF" });
+        await this.ingestSarif(
+          semgrepSarif,
+          "semgrep",
+          "sast",
+          findings,
+          evidence,
+          "no semgrep SARIF produced",
+        );
+      }
+    } catch (err) {
+      lastError = `semgrep step failed: ${String(err)}`;
+      this.host?.logger?.error?.(LOG_NAMESPACE, lastError);
+    }
+
+    input.onProgress?.({ pct: 55, message: "Running osv-scanner (SCA)" });
+
+    // ---- osv-scanner ----
+    try {
+      const osvSarif = path.join(input.workdir, "osv.sarif");
+      const osvArgs = ["--format", "sarif", "--output", osvSarif];
+      if (cfg.extraOsvScannerArgs) osvArgs.push(...cfg.extraOsvScannerArgs);
+      osvArgs.push(input.repoLocalPath);
+
+      const osvRes = await this.spawnAndWait(input.runId, this.osvScannerPath!, osvArgs, {
+        timeoutMs,
+      });
+
+      // osv-scanner exit codes: 0 = no findings, 1 = findings present.
+      // 128 = no manifests found (treated as success-with-zero-findings).
+      if (osvRes.code !== 0 && osvRes.code !== 1 && osvRes.code !== 128) {
+        const msg = `osv-scanner exited ${osvRes.code}: ${osvRes.stderr.slice(0, 500)}`;
+        this.host?.logger?.warn?.(LOG_NAMESPACE, msg);
+        if (!lastError) lastError = msg;
+      } else {
+        input.onProgress?.({ pct: 80, message: "Parsing osv-scanner SARIF" });
+        await this.ingestSarif(
+          osvSarif,
+          "osv-scanner",
+          "vuln",
+          findings,
+          evidence,
+          "no osv-scanner SARIF produced",
+        );
+      }
+    } catch (err) {
+      const msg = `osv-scanner step failed: ${String(err)}`;
+      this.host?.logger?.error?.(LOG_NAMESPACE, msg);
+      if (!lastError) lastError = msg;
+    }
+
+    input.onProgress?.({ pct: 100, message: "Scan complete" });
+
+    const summary = summarize(findings);
+    const status =
+      findings.length === 0 && lastError ? ("errored" as const) : ("succeeded" as const);
 
     return {
       runId: input.runId,
-      status: "succeeded",
-      findings: [finding],
-      evidence: [],
+      status,
+      findings,
+      evidence,
       durationMs: Date.now() - startedAt,
       summary,
+      errorReason: status === "errored" ? lastError : undefined,
     };
   }
 
-  async cancel(_runId: string): Promise<void> {
-    // Stub provider has no in-flight subprocesses to cancel.
+  async cancel(runId: string): Promise<void> {
+    const child = this.active.get(runId);
+    if (!child) return;
+    try {
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, 5000);
+    } finally {
+      this.active.delete(runId);
+    }
   }
 
   metadata(): SecurityProviderMetadata {
@@ -126,7 +234,206 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
         "vscode-extension",
       ],
       toolVersion: this.toolVersion,
-      description: "Semgrep (full ruleset) + osv-scanner for pull_request.deep",
+      description: "Semgrep (p/default ruleset) + osv-scanner for pull_request.deep",
     };
   }
+
+  private async ingestSarif(
+    sarifPath: string,
+    providerLabel: string,
+    category: "sast" | "vuln",
+    findings: NormalizedFinding[],
+    evidence: ScanEvidenceArtifact[],
+    missingMessage: string,
+  ): Promise<void> {
+    try {
+      const raw = await fs.readFile(sarifPath, "utf-8");
+      const parsed = normalizeSarif(raw, providerLabel, category);
+      for (const f of parsed) findings.push(f);
+      const sha256 = createHash("sha256").update(raw).digest("hex");
+      const stat = await fs.stat(sarifPath);
+      evidence.push({
+        type: "sarif",
+        localPath: sarifPath,
+        sha256,
+        sizeBytes: stat.size,
+      });
+    } catch (err) {
+      this.host?.logger?.warn?.(LOG_NAMESPACE, `${missingMessage}: ${String(err)}`);
+    }
+  }
+
+  private spawnAndWait(
+    runId: string,
+    bin: string,
+    args: string[],
+    opts: { timeoutMs: number },
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    return new Promise((resolve) => {
+      const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.active.set(runId, child);
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          /* already gone */
+        }
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }, 5000);
+      }, opts.timeoutMs);
+      child.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
+      child.stderr?.on("data", (b: Buffer) => (stderr += b.toString()));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        this.active.delete(runId);
+        resolve({ code, stdout, stderr });
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        this.active.delete(runId);
+        resolve({ code: -1, stdout, stderr: err.message });
+      });
+    });
+  }
+
+  private async resolveSemgrep(log: {
+    info?: (m: string) => void;
+    warn?: (m: string) => void;
+    error?: (m: string) => void;
+  }): Promise<string> {
+    // 1. PATH probe.
+    const onPath = await this.whichBinary("semgrep");
+    if (onPath) {
+      const ver = await this.binaryVersionOutput(onPath);
+      if (ver.includes(SEMGREP_VERSION)) {
+        log.info?.(`semgrep found on PATH at ${onPath} (matches ${SEMGREP_VERSION})`);
+        return onPath;
+      }
+      // Different version on PATH — still use it (the host probably knows).
+      log.info?.(
+        `semgrep found on PATH at ${onPath} (version output: ${ver.slice(0, 200)}); using it as-is`,
+      );
+      return onPath;
+    }
+
+    // 2. Auto-install: pipx preferred, then pip --user.
+    const userBinDir = path.join(os.homedir(), ".local", "bin");
+
+    if (await this.whichBinary("pipx")) {
+      log.info?.(`semgrep not on PATH; running 'pipx install semgrep==${SEMGREP_VERSION}'`);
+      try {
+        await this.runOneShot("pipx", ["install", "--force", `semgrep==${SEMGREP_VERSION}`], {
+          timeoutMs: 5 * 60 * 1000,
+        });
+        const semgrep = path.join(userBinDir, "semgrep");
+        try {
+          await fs.access(semgrep);
+          return semgrep;
+        } catch {
+          // pipx may put binaries elsewhere; fall back to PATH probe.
+          const afterPath = await this.whichBinary("semgrep");
+          if (afterPath) return afterPath;
+        }
+      } catch (err) {
+        log.warn?.(`pipx install semgrep failed: ${String(err)}`);
+      }
+    }
+
+    if (await this.whichBinary("python3")) {
+      log.info?.(
+        `semgrep not on PATH; running 'python3 -m pip install --user semgrep==${SEMGREP_VERSION}'`,
+      );
+      try {
+        await this.runOneShot(
+          "python3",
+          ["-m", "pip", "install", "--user", `semgrep==${SEMGREP_VERSION}`],
+          { timeoutMs: 5 * 60 * 1000 },
+        );
+        const semgrep = path.join(userBinDir, "semgrep");
+        try {
+          await fs.access(semgrep);
+          return semgrep;
+        } catch {
+          const afterPath = await this.whichBinary("semgrep");
+          if (afterPath) return afterPath;
+        }
+      } catch (err) {
+        log.warn?.(`pip install semgrep failed: ${String(err)}`);
+      }
+    }
+
+    throw new Error(
+      "semgrep not installed and no pipx/pip available. Install via 'pipx install semgrep' or 'pip install semgrep==" +
+        SEMGREP_VERSION +
+        "'.",
+    );
+  }
+
+  private whichBinary(bin: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const child = spawn("which", [bin], { stdio: ["ignore", "pipe", "ignore"] });
+      let out = "";
+      child.stdout?.on("data", (b: Buffer) => (out += b.toString()));
+      child.on("close", (code) => {
+        if (code !== 0) return resolve(null);
+        const p = out.trim();
+        resolve(p || null);
+      });
+      child.on("error", () => resolve(null));
+    });
+  }
+
+  private binaryVersionOutput(bin: string): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(bin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      child.stdout?.on("data", (b: Buffer) => (out += b.toString()));
+      child.stderr?.on("data", (b: Buffer) => (out += b.toString()));
+      child.on("close", () => resolve(out));
+      child.on("error", () => resolve(""));
+    });
+  }
+
+  private runOneShot(
+    bin: string,
+    args: string[],
+    opts: { timeoutMs: number },
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          /* already gone */
+        }
+      }, opts.timeoutMs);
+      child.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
+      child.stderr?.on("data", (b: Buffer) => (stderr += b.toString()));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve({ code, stdout, stderr });
+        else reject(new Error(`${bin} exited ${code}: ${stderr.slice(0, 500)}`));
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+}
+
+function summarize(findings: NormalizedFinding[]): SecurityScanSummary {
+  const s: SecurityScanSummary = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of findings) s[f.severity]++;
+  return s;
 }
