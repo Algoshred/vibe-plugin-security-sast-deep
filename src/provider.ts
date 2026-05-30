@@ -61,8 +61,7 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
   }
 
   async ensureToolInstalled(): Promise<void> {
-    const dataDir =
-      this.host?.getDataDir?.() ?? path.join(os.homedir(), ".boff/vibecontrols");
+    const dataDir = this.host?.getDataDir?.() ?? path.join(os.homedir(), ".boff/vibecontrols");
     const ctx = {
       dataDir,
       log: {
@@ -377,17 +376,13 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
   }
 
   private whichBinary(bin: string): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawn("which", [bin], { stdio: ["ignore", "pipe", "ignore"] });
-      let out = "";
-      child.stdout?.on("data", (b: Buffer) => (out += b.toString()));
-      child.on("close", (code) => {
-        if (code !== 0) return resolve(null);
-        const p = out.trim();
-        resolve(p || null);
-      });
-      child.on("error", () => resolve(null));
-    });
+    // Bun.which is cross-platform (honours PATHEXT / where semantics on
+    // Windows) and returns an absolute path or null without spawning a
+    // POSIX-only `which` process. Pass the live PATH explicitly — Bun.which
+    // otherwise snapshots PATH at process start and would miss binaries
+    // installed mid-run (e.g. a pipx/pip --user semgrep added to ~/.local/bin),
+    // which the previous `spawn('which', ...)` resolved via the inherited env.
+    return Promise.resolve(Bun.which(bin, { PATH: process.env.PATH }));
   }
 
   private binaryVersionOutput(bin: string): Promise<string> {
