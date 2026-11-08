@@ -72,7 +72,11 @@ export class SemgrepOsvScannerProvider implements SecurityProvider {
     };
 
     // osv-scanner: shipped as a pinned binary + sha256. Pure download path.
-    this.osvScannerPath = await resolveToolPath(ctx, "osv-scanner", TOOLS_MANIFEST["osv-scanner"]);
+    const osvScannerEntry = TOOLS_MANIFEST["osv-scanner"];
+    if (!osvScannerEntry) {
+      throw new Error("osv-scanner entry missing from the tools manifest");
+    }
+    this.osvScannerPath = await resolveToolPath(ctx, "osv-scanner", osvScannerEntry);
 
     // semgrep: PATH first; if not present, attempt pipx then pip --user.
     this.semgrepPath = await this.resolveSemgrep(ctx.log);
